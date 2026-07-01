@@ -641,6 +641,109 @@ Flash_fwd_kernel_traits<
 >
 ```
 
+### 5.2.1 Flash_fwd_kernel_traits 详细解析
+
+**文件**：`csrc/flash_attn/src/kernel_traits.h`（第 51-159 行）
+
+这是 Flash Attention V2 最核心的模板结构体，定义了 kernel 的所有静态配置：
+
+```cpp
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+         bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t>
+struct Flash_fwd_kernel_traits : public Base {
+    // ── 类型定义 ─────────────────────────────────────────
+    using Element = elem_type;           // 输入数据类型：fp16 或 bf16
+    using ElementAccum = float;          // MMA 累加器类型：始终 float32
+    using index_t = int64_t;
+
+    // ── MMA 配置 ─────────────────────────────────────────
+    // SM80 Tensor Core: 16×8×16 MMA
+    using TiledMma = TiledMMA<
+        Base::MMA_Atom_Arch,
+        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4×1×1 warp 组
+        Tile<Int<16 * kNWarps>, _16, _16>>;
+
+    // ── 线程配置 ─────────────────────────────────────────
+    static constexpr int kNWarps = kNWarps_;      // warp 数量（通常 4）
+    static constexpr int kNThreads = kNWarps * 32; // 线程数（128 或 256）
+
+    // ── Block 尺寸 ──────────────────────────────────────
+    static constexpr int kBlockM = kBlockM_;      // Q tile 的行数
+    static constexpr int kBlockN = kBlockN_;      // K/V tile 的行数
+    static constexpr int kHeadDim = kHeadDim_;   // head 维度
+
+    // ── SMEM 布局 ────────────────────────────────────────
+    // Swizzling 参数：避免 bank conflict
+    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+
+    // Q 的 SMEM 布局（swizzled）
+    using SmemLayoutQ = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+
+    // K/V 的 SMEM 布局（与 Q 相同）
+    using SmemLayoutKV = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+
+    // V 转置后的 SMEM 布局（用于 PV GEMM）
+    using SmemLayoutVtransposed = ...;
+
+    // ── SMEM 大小计算 ───────────────────────────────────
+    static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
+    static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
+    static constexpr int kSmemSize = Share_Q_K_smem
+        ? std::max(kSmemQSize, kSmemKVSize)  // 共享时取最大
+        : kSmemQSize + kSmemKVSize;          // 分别分配
+
+    // ── GMEM 拷贝配置 ──────────────────────────────────
+    // 每个线程一次读取 128 bits (8 × fp16)
+    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
+
+    // GMEM → SMEM 异步拷贝
+    using GmemTiledCopyQKV = decltype(
+        make_tiled_copy(
+            Copy_Atom<Gmem_copy_struct, Element>{},
+            GmemLayoutAtom{},
+            Layout<Shape<_1, _8>>{}));  // 每次读取 8 个元素
+
+    // SMEM → GMEM 输出拷贝
+    using GmemTiledCopyO = ...;
+};
+```
+
+**关键成员详解**：
+
+| 成员 | 说明 | 示例值 |
+|------|------|--------|
+| `Element` | 输入数据类型 | `cutlass::half_t` (fp16) / `cutlass::bfloat16_t` (bf16) |
+| `ElementAccum` | MMA 累加器精度 | `float` (始终 32 位) |
+| `kBlockM` | Q tile 的 M 维度大小 | 64 / 128 |
+| `kBlockN` | K/V tile 的 N 维度大小 | 32 / 64 / 128 |
+| `kNWarps` | 每个 CTA 的 warp 数 | 4 |
+| `kNThreads` | 每个 CTA 的线程数 | 128 (= 4 × 32) |
+| `kHeadDim` | head 维度 | 32 / 64 / 128 / 256 |
+| `Is_Q_in_regs` | Q 是否常驻寄存器 | true / false |
+| `Share_Q_K_smem` | Q 和 K 是否共享 SMEM | true / false |
+| `kSmemSize` | 所需 SMEM 大小 | 约 40-96 KB |
+| `TiledMma` | MMA 操作布局 | 4×1×1 warp 组，16×16 tile |
+
+**SMEM 布局的 Swizzling**：
+
+```cpp
+// kSwizzle = 2 或 3，决定 swizzle 模式
+using SmemLayoutAtomQ = decltype(
+    composition(
+        Swizzle<kSwizzle, 3, 3>{},  // 8×8 或 16×16 swizzle
+        Layout<Shape<_8, Int<kBlockKSmem>>,
+               Stride<Int<kBlockKSmem>, _1>>{}));
+```
+
+Swizzling 通过交织访问模式避免 shared memory 的 bank conflict：
+- `kSwizzle=2`：8×8 pattern
+- `kSwizzle=3`：16×16 pattern
+
 ### 5.3 核心启动函数：`run_flash_fwd`
 
 ```cpp
